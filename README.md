@@ -1,169 +1,140 @@
 # RTMP Squid CLI
 
-Command-line tool for streaming video files to RTMP servers.
+Stream a folder of video files to any RTMP server — AngelThump, Twitch, YouTube,
+or anything else — as a continuous 24/7 broadcast that **never drops the
+connection between files**.
+
+It's a single shell script. No Node, no npm, no packages — just `ffmpeg`,
+`ffprobe`, and standard coreutils. The whole thing is one file you can read,
+audit, and copy to a server.
+
+This is the command-line counterpart to the RTMP Squid web app, and it
+reproduces the web app's streaming core:
+
+- **Never-stopping stream** — one persistent encoder holds the RTMP connection
+  for the whole session. Files are piped through a FIFO one after another, so the
+  connection is never dropped between videos.
+- **Auto-filling queue** — point it at a folder and it builds an endless random
+  (or sequential) queue that tops itself up and loops forever.
+- **Auto-reconnect** — if the link drops, it reconnects with exponential backoff
+  and resumes the current file where it left off. A stall watchdog catches a
+  half-open connection that hasn't fully died.
+- **Standby slate** — a "STANDBY" card covers any gap when there's nothing to
+  play, so the connection still never drops.
+- **Platform-safe encode** — H.264 High profile, true CBR, 2-second keyframes,
+  yuv420p, 48 kHz AAC by default. Satisfies Twitch, Kick, and AngelThump at once.
 
 ## Requirements
 
-- Node.js 18 or higher
-- FFmpeg 4.0 or higher
+- Linux or macOS
+- FFmpeg 4.0+ (with `libx264` and `aac`) — provides `ffmpeg` and `ffprobe`
+- A POSIX shell (`bash` 3.2+, which is standard on macOS and Linux)
 
-## Installation
+Check your system:
 
 ```bash
-npm install
+./rtmpsquid --check
+```
+
+## Install
+
+There's nothing to build or install — copy the `rtmpsquid` script anywhere and
+run it. To make it available everywhere:
+
+```bash
+install -m 755 rtmpsquid /usr/local/bin/rtmpsquid
+```
+
+Install FFmpeg if you don't have it:
+
+```bash
+sudo apt install -y ffmpeg     # Debian/Ubuntu
+brew install ffmpeg            # macOS
 ```
 
 ## Usage
 
+Non-interactive (scripts, servers):
+
 ```bash
-npm start
-# or
-./start.sh         # Linux/macOS
-start.bat          # Windows
+rtmpsquid \
+  --library /path/to/videos \
+  --url rtmp://live.twitch.tv/app \
+  --key YOUR_STREAM_KEY
 ```
 
-## Quick Setup
+Interactive — run it bare on a terminal and it walks you through the setup:
 
-### Ubuntu/Debian
 ```bash
-sudo apt update
-sudo apt install -y nodejs npm ffmpeg
-cd cli
-npm install
-npm start
+rtmpsquid
 ```
 
-### macOS
+Every option also reads from an environment variable, so you can keep settings
+in a file and `source` it, or pass them inline:
+
 ```bash
-brew install node ffmpeg
-cd cli
-npm install
-npm start
+LIBRARY=/srv/movies RTMP_URL=rtmp://ingest.angelthump.com/live STREAM_KEY=… rtmpsquid
 ```
 
-### Windows
-1. Install Node.js from https://nodejs.org/
-2. Install FFmpeg from https://ffmpeg.org/download.html
-3. Run `start.bat`
+### Running 24/7 on a server
 
-## Check System Compatibility
+Use `tmux` (or a systemd unit) so it survives your SSH session:
 
 ```bash
-npm run check
-```
-
-This verifies Node.js version, FFmpeg installation, and dependencies.
-
-## Features
-
-- Recursive folder scanning for video files
-- Smart shuffle (avoids repeating last 50 videos)
-- Folder watching (auto-detects new files)
-- Interactive playlist controls during streaming
-- Multiple RTMP platforms (AngelThump, Twitch, YouTube, custom)
-- Configurable bitrate, resolution, audio settings
-- Auto-loop for continuous streaming
-- Aspect ratio preservation with black bars
-
-## Supported Formats
-
-.mp4, .avi, .mov, .mkv, .flv, .wmv, .webm, .m4v, .mpg, .mpeg, .3gp
-
-## Interactive Controls
-
-While streaming:
-- `n` - Skip to next video
-- `p` - Playlist manager (reorder, remove videos)
-- `s` - Reshuffle queue
-- `i` - Show stream info
-- `q` - Quit
-- `Ctrl+C` - Force quit
-
-## Configuration Options
-
-### Video Bitrates
-1000k, 1500k, 2000k, 2500k, 3000k, 3500k, 4000k, 4500k, 5000k, 6000k, 7000k, 8000k, 10000k, 12000k
-
-### Audio Bitrates
-96k, 128k, 160k, 192k, 256k, 320k
-
-### Resolutions
-- 1280x720 (720p)
-- 1920x1080 (1080p)
-- 2560x1440 (1440p)
-- 3840x2160 (4K)
-
-### Audio Channels
-- Mono (1)
-- Stereo (2)
-- 5.1 Surround (6)
-
-## RTMP Services
-
-### AngelThump
-URL: `rtmp://ingest.angelthump.com/live`
-
-### Twitch
-URL: `rtmp://live.twitch.tv/app`
-
-### YouTube
-URL: `rtmp://a.rtmp.youtube.com/live2`
-
-### Custom
-Enter any RTMP URL and stream key.
-
-## Troubleshooting
-
-### "node: command not found"
-Install Node.js:
-- Ubuntu/Debian: `curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash - && sudo apt install -y nodejs`
-- macOS: `brew install node`
-- Windows: Download from https://nodejs.org/
-
-### "ffmpeg: command not found"
-Install FFmpeg:
-- Ubuntu/Debian: `sudo apt install ffmpeg`
-- macOS: `brew install ffmpeg`
-- Windows: Download from https://ffmpeg.org/download.html and add to PATH
-
-### "Permission denied: ./start.sh"
-```bash
-chmod +x start.sh stream.js check-system.js
-```
-
-### npm permission errors
-```bash
-mkdir ~/.npm-global
-npm config set prefix '~/.npm-global'
-echo 'export PATH=~/.npm-global/bin:$PATH' >> ~/.bashrc
-source ~/.bashrc
-```
-
-## Remote Server Setup
-
-```bash
-# Upload CLI folder
-scp -r cli/ user@server:/home/user/
-
-# SSH to server
-ssh user@server
-
-# Install dependencies
-sudo apt install -y nodejs npm ffmpeg
-
-# Setup and run
-cd cli
-npm install
 tmux new -s stream
-./start.sh
+rtmpsquid --library /srv/movies --url rtmp://… --key …
+# detach with Ctrl-b d ; reattach with: tmux attach -t stream
 ```
 
-## Dependencies
+## Options
 
-- chalk - Terminal colors
-- inquirer - Interactive prompts
-- chokidar - Folder watching
-- fluent-ffmpeg - FFmpeg wrapper
+| Flag | Env | Default | Meaning |
+|---|---|---|---|
+| `--library DIR` | `LIBRARY` | — | Folder of videos (scanned recursively) |
+| `--url URL` | `RTMP_URL` | — | RTMP/RTMPS ingest URL |
+| `--key KEY` | `STREAM_KEY` | — | Stream key (appended to the URL) |
+| `--resolution WxH` | `RESOLUTION` | `1920x1080` | Output resolution |
+| `--fps N` | `FPS` | `30` | Output frame rate |
+| `--bitrate RATE` | `VBITRATE` | `3000k` | Video bitrate (CBR) |
+| `--audio-bitrate RATE` | `ABITRATE` | `160k` | Audio bitrate |
+| `--audio-channels N` | `ACHANNELS` | `2` | 1, 2, or 6 |
+| `--fit MODE` | `FIT` | `fit` | `fit` (letterbox), `stretch`, or `crop` |
+| `--sequential` | `SHUFFLE=0` | shuffle | Play in name order instead of shuffling |
+| `--no-reconnect` | `AUTO_RESTART=0` | reconnect on | Don't auto-reconnect on a drop |
+| `--no-title` | `SHOW_TITLE=0` | overlay on | Hide the on-screen movie-name overlay |
+| `--min-mb N` | `MIN_MOVIE_MB` | `5` | Ignore files smaller than N MB |
+| `--preset NAME` | `PRESET` | `veryfast` | x264 preset |
+| `--check` | | | Verify ffmpeg/ffprobe and exit |
+| `--help` | | | Show help |
+
+## Keyboard controls
+
+While streaming on a terminal:
+
+| Key | Action |
+|---|---|
+| `n` | Skip to the next video |
+| `s` | Reshuffle the queue |
+| `i` | Show stream info (current file, queue, live bitrate) |
+| `q` | Quit |
+| `Ctrl-C` | Quit |
+
+## How it works
+
+A single persistent **streamer** ffmpeg reads a continuous MPEG-TS byte stream
+from a FIFO and copies it straight to the RTMP server — this is the one process
+that holds the connection. The script keeps a read-write file descriptor open on
+the FIFO (`exec 3<>fifo`) so the reader never sees end-of-file between videos.
+
+For each video, a short-lived **feeder** ffmpeg encodes it to the platform-safe
+profile and writes the result into the FIFO; a standby slate feeder fills any
+gap. Each feeder's output timestamps are offset so the concatenated stream stays
+monotonic across files. When the RTMP link drops, the streamer is rebuilt with
+backoff and the current file resumes where it left off.
+
+## Supported formats
+
+`.mp4 .mkv .webm .mov .avi .flv .wmv .m4v .mpg .mpeg .3gp .ts .m2ts .ogv`
 
 ## License
 

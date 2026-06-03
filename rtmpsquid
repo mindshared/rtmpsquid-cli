@@ -1,0 +1,658 @@
+#!/usr/bin/env bash
+#
+# RTMP Squid CLI — a dependency-free, never-dropping RTMP streamer.
+#
+# Streams a folder of video files to any RTMP(S) server as one continuous 24/7
+# broadcast that never drops the connection between files. It is the shell
+# equivalent of the RTMP Squid web app's streaming core: a single persistent
+# "streamer" ffmpeg holds the RTMP connection for the whole session and reads a
+# continuous MPEG-TS byte stream from a FIFO; short-lived "feeder" ffmpegs (one
+# per file, plus a standby slate when the queue is empty) write into that FIFO
+# one after another. A read-write fd we hold open on the FIFO keeps the reader
+# from ever seeing EOF between feeders, so the platform connection stays up.
+#
+# No Node, no npm, no packages — just ffmpeg, ffprobe and coreutils.
+#
+# Usage:  rtmpsquid --library DIR --url rtmp://… --key STREAMKEY [options]
+#         rtmpsquid                 # no args on a terminal → interactive setup
+#         rtmpsquid --check         # verify ffmpeg/ffprobe are present and exit
+#         rtmpsquid --help
+#
+# Written for bash 3.2+ (stock macOS and any Linux). Avoids bash-4-only features.
+
+# Manual error handling throughout — ffmpeg feeders failing on a bad file is an
+# expected, recoverable event, so we deliberately do NOT use `set -e`. `set -u`
+# is avoided too: bash 3.2 errors on empty-array expansion under it.
+set -o pipefail 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# Defaults (every one overridable by a flag or an environment variable, so the
+# same numbers as the web app's config.js apply out of the box).
+# ---------------------------------------------------------------------------
+RTMP_URL="${RTMP_URL:-}"
+STREAM_KEY="${STREAM_KEY:-}"
+LIBRARY="${LIBRARY:-}"
+
+RESOLUTION="${RESOLUTION:-1920x1080}"
+FPS="${FPS:-30}"
+VBITRATE="${VBITRATE:-3000k}"        # video bitrate (CBR target)
+ABITRATE="${ABITRATE:-160k}"         # audio bitrate
+ACHANNELS="${ACHANNELS:-2}"
+FIT="${FIT:-fit}"                    # fit | stretch | crop
+
+PRESET="${PRESET:-veryfast}"
+PROFILE="${PROFILE:-high}"           # 'none' to omit
+TUNE="${TUNE:-zerolatency}"          # 'none' to omit
+GOPSEC="${GOPSEC:-2}"                # keyframe interval in seconds
+PIXFMT="${PIXFMT:-yuv420p}"
+
+MIN_MOVIE_MB="${MIN_MOVIE_MB:-5}"    # ignore files smaller than this
+SCAN_MAX_DEPTH="${SCAN_MAX_DEPTH:-12}"
+QUEUE_TARGET="${QUEUE_TARGET:-20}"
+QUEUE_MIN="${QUEUE_MIN:-5}"
+
+SHUFFLE="${SHUFFLE:-1}"              # 1 = random order, 0 = sequential
+AUTO_RESTART="${AUTO_RESTART:-1}"    # 1 = reconnect on RTMP drop
+SHOW_TITLE="${SHOW_TITLE:-1}"        # 1 = bottom-left movie-name overlay
+
+RECONNECT_BASE=2                     # first reconnect delay (s); doubles each fail
+RECONNECT_MAX=15                     # backoff ceiling (s)
+HEALTHY_RUN=60                       # a streamer alive this long resets the backoff
+STALL_TIMEOUT=12                     # no streamer progress for this long ⇒ reconnect
+SLATE_SECONDS=8                      # length of each standby-slate segment
+RESUME_REWIND=2                      # seconds to rewind a file when resuming after a drop
+RW_TIMEOUT_US=20000000               # ffmpeg RTMP socket read/write timeout (µs)
+
+VIDEO_EXTS="mp4 mkv webm mov avi flv wmv m4v mpg mpeg 3gp ts m2ts ogv"
+
+# A usable font for the slate / title overlay (optional — plain card if none).
+FONT=""
+for f in \
+  /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf \
+  /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf \
+  /usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf \
+  "/System/Library/Fonts/Supplemental/Arial Bold.ttf"; do
+  [ -f "$f" ] && { FONT="$f"; break; }
+done
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+say()  { printf '%s\n' "$*"; }
+info() { printf '\033[36m%s\033[0m\n' "$*"; }     # cyan
+ok()   { printf '\033[32m%s\033[0m\n' "$*"; }     # green
+warn() { printf '\033[33m%s\033[0m\n' "$*" >&2; } # yellow
+err()  { printf '\033[31m%s\033[0m\n' "$*" >&2; } # red
+die()  { err "$*"; exit 1; }
+
+usage() {
+  cat <<'EOF'
+RTMP Squid CLI — continuous RTMP streaming from a folder of videos.
+
+Usage:
+  rtmpsquid --library DIR --url URL --key KEY [options]
+  rtmpsquid                  Interactive setup (when run on a terminal)
+  rtmpsquid --check          Verify ffmpeg/ffprobe and exit
+  rtmpsquid --help
+
+Required:
+  --library DIR              Folder of videos to stream (recursive)
+  --url URL                  RTMP/RTMPS ingest URL (e.g. rtmp://live.twitch.tv/app)
+  --key KEY                  Stream key (appended to the URL)
+
+Common options:
+  --resolution WxH           Output resolution           (default 1920x1080)
+  --fps N                    Output frame rate            (default 30)
+  --bitrate RATE             Video bitrate, CBR           (default 3000k)
+  --audio-bitrate RATE       Audio bitrate                (default 160k)
+  --audio-channels N         1 | 2 | 6                    (default 2)
+  --fit MODE                 fit | stretch | crop         (default fit)
+  --sequential               Play in name order instead of shuffling
+  --no-reconnect             Do not auto-reconnect on an RTMP drop
+  --no-title                 Hide the on-screen movie-name overlay
+  --min-mb N                 Ignore files smaller than N MB (default 5)
+  --preset NAME              x264 preset                  (default veryfast)
+  -h, --help                 Show this help
+
+While streaming (on a terminal):
+  n  next   s  reshuffle   i  info   q  quit
+EOF
+}
+
+# Video bitrate string ("3000k", "3M", "6000k") → integer kbps, for bufsize.
+vbitrate_kbps() {
+  awk -v v="$1" 'BEGIN{
+    n=v+0; u=tolower(v); gsub(/[0-9. ]/,"",u); u=substr(u,1,1);
+    if(u=="m") printf "%d", n*1000;
+    else if(u=="g") printf "%d", n*1000000;
+    else printf "%d", n;   # k or bare
+  }'
+}
+
+# Integer microseconds → seconds string with µs precision (for -output_ts_offset).
+us_to_sec() {
+  awk -v us="$1" 'BEGIN{ if(us<0)us=0; printf "%d.%06d", int(us/1000000), us%1000000 }'
+}
+
+# Last value of a key (e.g. out_time_us) in an ffmpeg -progress file. Reads only
+# the tail so it stays cheap no matter how large the streamer's progress grows.
+last_progress() {
+  tail -c 4096 "$2" 2>/dev/null | grep "^$1=" | tail -1 | cut -d= -f2
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+DO_CHECK=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --library|--dir) LIBRARY="$2"; shift 2;;
+    --url)           RTMP_URL="$2"; shift 2;;
+    --key)           STREAM_KEY="$2"; shift 2;;
+    --resolution)    RESOLUTION="$2"; shift 2;;
+    --fps)           FPS="$2"; shift 2;;
+    --bitrate)       VBITRATE="$2"; shift 2;;
+    --audio-bitrate) ABITRATE="$2"; shift 2;;
+    --audio-channels) ACHANNELS="$2"; shift 2;;
+    --fit)           FIT="$2"; shift 2;;
+    --sequential)    SHUFFLE=0; shift;;
+    --shuffle)       SHUFFLE=1; shift;;
+    --no-reconnect)  AUTO_RESTART=0; shift;;
+    --no-title)      SHOW_TITLE=0; shift;;
+    --min-mb)        MIN_MOVIE_MB="$2"; shift 2;;
+    --preset)        PRESET="$2"; shift 2;;
+    --check)         DO_CHECK=1; shift;;
+    -h|--help)       usage; exit 0;;
+    *) die "Unknown option: $1 (try --help)";;
+  esac
+done
+
+# ---------------------------------------------------------------------------
+# Preflight
+# ---------------------------------------------------------------------------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+if [ "$DO_CHECK" -eq 1 ]; then
+  info "RTMP Squid CLI — system check"
+  rc=0
+  for bin in ffmpeg ffprobe mkfifo; do
+    if have "$bin"; then ok "  ✓ $bin  ($(command -v "$bin"))"; else err "  ✗ $bin missing"; rc=1; fi
+  done
+  if have ffmpeg; then say "  $(ffmpeg -version 2>/dev/null | head -1)"; fi
+  [ -n "$FONT" ] && ok "  ✓ overlay font: $FONT" || warn "  • no overlay font found (slate will be a plain card)"
+  exit $rc
+fi
+
+have ffmpeg  || die "ffmpeg not found. Install it: apt install ffmpeg  /  brew install ffmpeg"
+have ffprobe || die "ffprobe not found (ships with ffmpeg)."
+have mkfifo  || die "mkfifo not found (coreutils)."
+
+# ---------------------------------------------------------------------------
+# Interactive setup when run bare on a terminal and missing essentials.
+# ---------------------------------------------------------------------------
+if [ -t 0 ] && { [ -z "$LIBRARY" ] || [ -z "$RTMP_URL" ] || [ -z "$STREAM_KEY" ]; }; then
+  info "RTMP Squid CLI — interactive setup (Ctrl-C to abort)"
+  while [ -z "$LIBRARY" ] || [ ! -d "$LIBRARY" ]; do
+    printf 'Video folder: '; IFS= read -r LIBRARY
+    [ -d "$LIBRARY" ] || warn "  not a folder, try again"
+  done
+  if [ -z "$RTMP_URL" ]; then
+    say "Platform:  1) AngelThump  2) Twitch  3) YouTube  4) Custom"
+    printf 'Choice [1]: '; IFS= read -r choice
+    case "${choice:-1}" in
+      1) RTMP_URL="rtmp://ingest.angelthump.com/live";;
+      2) RTMP_URL="rtmp://live.twitch.tv/app";;
+      3) RTMP_URL="rtmp://a.rtmp.youtube.com/live2";;
+      *) printf 'Custom RTMP URL: '; IFS= read -r RTMP_URL;;
+    esac
+  fi
+  while [ -z "$STREAM_KEY" ]; do
+    printf 'Stream key: '; IFS= read -rs STREAM_KEY; echo
+  done
+  printf "Video bitrate [%s]: " "$VBITRATE"; IFS= read -r ans; [ -n "$ans" ] && VBITRATE="$ans"
+  printf "Resolution [%s]: " "$RESOLUTION"; IFS= read -r ans; [ -n "$ans" ] && RESOLUTION="$ans"
+fi
+
+# ---------------------------------------------------------------------------
+# Validate
+# ---------------------------------------------------------------------------
+[ -n "$LIBRARY" ]   || die "No --library folder given (try --help)."
+[ -d "$LIBRARY" ]   || die "Library folder does not exist: $LIBRARY"
+[ -n "$RTMP_URL" ]  || die "No --url RTMP target given (try --help)."
+case "$RTMP_URL" in
+  rtmp://*|rtmps://*) :;;
+  *) die "Only rtmp:// or rtmps:// targets are allowed (got: $RTMP_URL)";;
+esac
+
+RTMP_FULL="$RTMP_URL"
+[ -n "$STREAM_KEY" ] && RTMP_FULL="$RTMP_URL/$STREAM_KEY"
+
+W="${RESOLUTION%x*}"; H="${RESOLUTION#*x}"
+case "$W$H" in *[!0-9]*|"") die "Bad --resolution: $RESOLUTION (expected WxH)";; esac
+GOP=$(( GOPSEC * FPS ))
+FRAME_US=$(( 1000000 / FPS ))
+VKBPS="$(vbitrate_kbps "$VBITRATE")"
+BUFSIZE="$(( VKBPS * 2 ))k"
+
+# ---------------------------------------------------------------------------
+# Shared ffmpeg encode args (platform-safe: x264 High, true CBR, 2s keyframes,
+# yuv420p, 48k AAC — satisfies Twitch / Kick / AngelThump at once).
+# ---------------------------------------------------------------------------
+OUT_ARGS=( -c:v libx264 -preset "$PRESET" -bf 0 )
+[ "$PROFILE" != none ] && OUT_ARGS+=( -profile:v "$PROFILE" )
+[ "$TUNE" != none ]    && OUT_ARGS+=( -tune "$TUNE" )
+OUT_ARGS+=( -b:v "$VBITRATE" -maxrate "$VBITRATE" -bufsize "$BUFSIZE" -x264opts nal-hrd=cbr )
+OUT_ARGS+=( -g "$GOP" -keyint_min "$GOP" -sc_threshold 0 -pix_fmt "$PIXFMT" )
+OUT_ARGS+=( -c:a aac -b:a "$ABITRATE" -ar 48000 -ac "$ACHANNELS" )
+
+# Content video filter (scale/fit + optional bottom-left title overlay). The
+# overlay reads its text from TITLEFILE (reload=1), written per file, so movie
+# names with colons/quotes/% need no filtergraph escaping.
+case "$FIT" in
+  stretch) SCALE="scale=${W}:${H}";;
+  crop)    SCALE="scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H}";;
+  *)       SCALE="scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:black";;
+esac
+VF="${SCALE},setsar=1,fps=${FPS},format=yuv420p"
+
+# Standby-slate input filter (solid card + STANDBY label if a font exists).
+SLATE_IN="color=c=0x0a1018:s=${W}x${H}:r=${FPS}"
+
+# ---------------------------------------------------------------------------
+# Working files (FIFO + per-feeder progress + overlay title text + logs).
+# ---------------------------------------------------------------------------
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/rtmpsquid.XXXXXX")"
+FIFO="$WORK/stream.ts"
+PROG="$WORK/feeder.progress"
+SPROG="$WORK/streamer.progress"
+TITLEFILE="$WORK/title.txt"
+FEEDERLOG="$WORK/feeder.log"
+STREAMERLOG="$WORK/streamer.log"
+: > "$TITLEFILE"
+
+if [ -n "$FONT" ] && [ "$SHOW_TITLE" -eq 1 ]; then
+  PAD=$(( H / 30 )); FS=$(( H / 40 ))
+  VF="${VF},drawtext=fontfile='${FONT}':textfile='${TITLEFILE}':reload=1:fontcolor=white@0.85:fontsize=${FS}:x=${PAD}:y=h-text_h-${PAD}:shadowcolor=black@0.7:shadowx=2:shadowy=2"
+fi
+if [ -n "$FONT" ]; then
+  SLATE_IN="${SLATE_IN},format=yuv420p,drawtext=fontfile='${FONT}':text='STANDBY':fontcolor=white:fontsize=$(( H / 16 )):x=(w-text_w)/2:y=(h-text_h)/2:box=1:boxcolor=black@0.4:boxborderw=20"
+fi
+
+# ---------------------------------------------------------------------------
+# Runtime state
+# ---------------------------------------------------------------------------
+STOPPING=0
+HOLDER_OPEN=0
+STREAMER_PID=""
+FEEDER_PID=""
+FEEDER_RC=0
+FEEDER_KIND=""        # content | slate
+CURRENT_FILE=""       # absolute path of the playing file ("" during slate)
+FEEDER_SEEK=0         # seconds seeked into CURRENT_FILE at feed time
+RESUME_SEC=""         # set after a drop → resume CURRENT_FILE here on reconnect
+TS_OFFSET_US=0        # running output-timestamp base (keeps the TS monotonic)
+RECONNECTS=0
+INTENTIONAL_SKIP=0
+declare -a LIBRARY_FILES=()
+declare -a QUEUE=()
+
+STTY_SAVE=""
+INTERACTIVE=0
+[ -t 0 ] && INTERACTIVE=1
+
+cleanup() {
+  STOPPING=1
+  # Graceful feeder shutdown: SIGINT lets ffmpeg flush before we force-kill.
+  if [ -n "$FEEDER_PID" ] && kill -0 "$FEEDER_PID" 2>/dev/null; then
+    kill -INT "$FEEDER_PID" 2>/dev/null
+    for _ in 1 2 3; do kill -0 "$FEEDER_PID" 2>/dev/null || break; sleep 0.5; done
+    kill -KILL "$FEEDER_PID" 2>/dev/null
+  fi
+  # Closing our held writer fd lets the streamer drain and send a clean RTMP EOS.
+  [ "$HOLDER_OPEN" -eq 1 ] && exec 3>&- 2>/dev/null
+  HOLDER_OPEN=0
+  if [ -n "$STREAMER_PID" ] && kill -0 "$STREAMER_PID" 2>/dev/null; then
+    kill -INT "$STREAMER_PID" 2>/dev/null
+    for _ in 1 2 3 4 5 6 7 8; do kill -0 "$STREAMER_PID" 2>/dev/null || break; sleep 0.5; done
+    kill -KILL "$STREAMER_PID" 2>/dev/null
+  fi
+  [ -n "$STTY_SAVE" ] && stty "$STTY_SAVE" 2>/dev/null
+  rm -rf "$WORK" 2>/dev/null
+}
+
+on_signal() { say ""; warn ">> stopping…"; cleanup; exit 0; }
+trap on_signal INT TERM
+trap 'cleanup' EXIT
+
+# ---------------------------------------------------------------------------
+# Library scan + queue
+# ---------------------------------------------------------------------------
+scan_library() {
+  LIBRARY_FILES=()
+  local minbytes=$(( MIN_MOVIE_MB * 1024 * 1024 ))
+  # Build the -iname extension filter for find.
+  local expr=() first=1 ext
+  for ext in $VIDEO_EXTS; do
+    if [ "$first" -eq 1 ]; then expr+=( -iname "*.$ext" ); first=0
+    else expr+=( -o -iname "*.$ext" ); fi
+  done
+  # find does not follow symlinks by default (so symlink cycles can't hang us),
+  # honours a depth cap, and a size floor drops sample/junk files. -print0 keeps
+  # paths with spaces/newlines intact.
+  local f
+  while IFS= read -r -d '' f; do
+    LIBRARY_FILES+=( "$f" )
+  done < <(find "$LIBRARY" -maxdepth "$SCAN_MAX_DEPTH" -type f \( "${expr[@]}" \) -size +"$(( minbytes - 1 ))"c -print0 2>/dev/null)
+  # Stable natural-ish order for sequential mode (shuffle ignores it).
+  if [ "$SHUFFLE" -eq 0 ] && [ "${#LIBRARY_FILES[@]}" -gt 1 ]; then
+    local sorted=()
+    while IFS= read -r -d '' f; do sorted+=( "$f" ); done \
+      < <(printf '%s\0' "${LIBRARY_FILES[@]}" | sort -z 2>/dev/null)
+    [ "${#sorted[@]}" -eq "${#LIBRARY_FILES[@]}" ] && LIBRARY_FILES=( "${sorted[@]}" )
+  fi
+}
+
+# Fisher-Yates shuffle of LIBRARY_FILES into the global SHUFFLED array.
+declare -a SHUFFLED=()
+shuffle_pool() {
+  SHUFFLED=( "${LIBRARY_FILES[@]}" )
+  local i j tmp n=${#SHUFFLED[@]}
+  i=$(( n - 1 ))
+  while [ "$i" -gt 0 ]; do
+    j=$(( RANDOM % (i + 1) ))
+    tmp="${SHUFFLED[$i]}"; SHUFFLED[$i]="${SHUFFLED[$j]}"; SHUFFLED[$j]="$tmp"
+    i=$(( i - 1 ))
+  done
+}
+
+SEQ_CURSOR=0
+# Top the queue up toward QUEUE_TARGET when it drops below QUEUE_MIN.
+refill_queue() {
+  local n=${#LIBRARY_FILES[@]}
+  [ "$n" -eq 0 ] && return
+  [ "${#QUEUE[@]}" -ge "$QUEUE_MIN" ] && return
+
+  if [ "$SHUFFLE" -eq 0 ]; then
+    # Sequential: walk the sorted library, wrapping forever.
+    while [ "${#QUEUE[@]}" -lt "$QUEUE_TARGET" ]; do
+      QUEUE+=( "${LIBRARY_FILES[$(( SEQ_CURSOR % n ))]}" )
+      SEQ_CURSOR=$(( (SEQ_CURSOR + 1) % n ))
+    done
+    return
+  fi
+
+  # Shuffle: prefer files not already queued / playing (avoid near-term repeats).
+  shuffle_pool
+  local f
+  for f in "${SHUFFLED[@]}"; do
+    [ "${#QUEUE[@]}" -ge "$QUEUE_TARGET" ] && break
+    if [ "$n" -gt "$QUEUE_TARGET" ] && in_use "$f"; then continue; fi
+    QUEUE+=( "$f" )
+  done
+  # Small library (fewer unique files than the target): allow replays so the
+  # queue still fills and loops.
+  while [ "${#QUEUE[@]}" -lt "$QUEUE_TARGET" ]; do
+    for f in "${SHUFFLED[@]}"; do
+      [ "${#QUEUE[@]}" -ge "$QUEUE_TARGET" ] && break
+      QUEUE+=( "$f" )
+    done
+    [ "${#SHUFFLED[@]}" -eq 0 ] && break
+  done
+}
+
+# Is a path currently playing or already in the queue?
+in_use() {
+  [ "$1" = "$CURRENT_FILE" ] && return 0
+  local q
+  for q in "${QUEUE[@]}"; do [ "$q" = "$1" ] && return 0; done
+  return 1
+}
+
+# Pop the head of the queue into NEXT_FILE ("" when nothing is available). Runs
+# in the current shell (NOT $(...)) so its queue mutations actually persist.
+NEXT_FILE=""
+dequeue() {
+  refill_queue
+  if [ "${#QUEUE[@]}" -eq 0 ]; then NEXT_FILE=""; return; fi
+  NEXT_FILE="${QUEUE[0]}"
+  QUEUE=( "${QUEUE[@]:1}" )
+  refill_queue
+}
+
+# ---------------------------------------------------------------------------
+# FIFO + streamer + feeders
+# ---------------------------------------------------------------------------
+
+# Fresh FIFO with our read-write holder fd pinned open, and a zeroed timestamp
+# base — used at start and on every reconnect so the new RTMP session begins
+# clean rather than jumping to a large leftover timestamp.
+reset_pipe() {
+  [ "$HOLDER_OPEN" -eq 1 ] && exec 3>&- 2>/dev/null
+  HOLDER_OPEN=0
+  rm -f "$FIFO"
+  mkfifo "$FIFO" || die "could not create FIFO at $FIFO"
+  # O_RDWR holder (like the web app's fs.open(fifo,'r+')): opens without blocking
+  # and guarantees the reader never sees EOF while feeders come and go.
+  exec 3<>"$FIFO"
+  HOLDER_OPEN=1
+  TS_OFFSET_US=0
+  : > "$SPROG"
+}
+
+# The persistent encoder: reads the FIFO, copies the stream straight to FLV/RTMP.
+# This is the one process that holds the connection to the platform.
+start_streamer() {
+  : > "$SPROG"
+  ffmpeg -nostdin -hide_banner -loglevel warning \
+    -fflags +genpts+igndts \
+    -f mpegts -i "$FIFO" \
+    -c copy \
+    -f flv -flush_packets 1 \
+    -progress "$SPROG" -nostats \
+    -rw_timeout "$RW_TIMEOUT_US" \
+    "$RTMP_FULL" </dev/null >/dev/null 2>>"$STREAMERLOG" &
+  STREAMER_PID=$!
+}
+
+# Advance the timestamp base by the previous feeder's real emitted duration
+# (read from its -progress out_time) plus one frame, so the concatenated MPEG-TS
+# the streamer copies stays strictly monotonic across files — no backward DTS,
+# no gap, no duplicate timestamps at the seam.
+advance_ts_offset() {
+  local us; us="$(last_progress out_time_us "$PROG")"
+  case "$us" in
+    ''|*[!0-9]*) us=0;;
+  esac
+  TS_OFFSET_US=$(( TS_OFFSET_US + us + FRAME_US ))
+}
+
+# Spawn a feeder. Arg1 = file path ("" for the standby slate); arg2 = seek secs.
+spawn_feeder() {
+  local file="$1" seek="$2"
+  rm -f "$PROG"
+  local ts_sec; ts_sec="$(us_to_sec "$TS_OFFSET_US")"
+  local args=( -nostdin -y -hide_banner -loglevel error -progress "$PROG" )
+
+  if [ -n "$file" ]; then
+    CURRENT_FILE="$file"; FEEDER_KIND="content"
+    FEEDER_SEEK="${seek:-0}"
+    if [ "$SHOW_TITLE" -eq 1 ]; then
+      local base="${file##*/}"; printf '%s' "${base%.*}" > "$TITLEFILE"
+    else
+      : > "$TITLEFILE"
+    fi
+    [ -n "$seek" ] && args+=( -ss "$seek" )
+    args+=( -re -i "$file" -map 0:V:0 -map "0:a:0?" -sn -dn -vf "$VF" )
+  else
+    CURRENT_FILE=""; FEEDER_KIND="slate"; FEEDER_SEEK=0
+    args+=( -re -f lavfi -i "$SLATE_IN" \
+            -f lavfi -i "anullsrc=channel_layout=stereo:sample_rate=48000" \
+            -t "$SLATE_SECONDS" )
+  fi
+  args+=( "${OUT_ARGS[@]}" -output_ts_offset "$ts_sec" -f mpegts "$FIFO" )
+
+  ffmpeg "${args[@]}" </dev/null >/dev/null 2>>"$FEEDERLOG" &
+  FEEDER_PID=$!
+}
+
+# Seconds into the current content file right now (seek + this feeder's emitted
+# time), for resuming in place after a reconnect.
+content_offset() {
+  local us; us="$(last_progress out_time_us "$PROG")"
+  case "$us" in ''|*[!0-9]*) us=0;; esac
+  awk -v s="$FEEDER_SEEK" -v us="$us" 'BEGIN{ printf "%d", s + int(us/1000000) }'
+}
+
+# ---------------------------------------------------------------------------
+# Interactive keyboard controls
+# ---------------------------------------------------------------------------
+print_now() {
+  if [ "$FEEDER_KIND" = slate ]; then
+    info "▶ STANDBY (queue empty)"
+  else
+    local base="${CURRENT_FILE##*/}"
+    ok "▶ $base"
+    [ "${#QUEUE[@]}" -gt 0 ] && say "   next: ${QUEUE[0]##*/}    (queue: ${#QUEUE[@]})"
+  fi
+}
+
+show_info() {
+  local br sp base
+  br="$(last_progress bitrate "$SPROG")"; sp="$(last_progress speed "$SPROG")"
+  base="${CURRENT_FILE##*/}"; [ -z "$base" ] && base="— (standby)"
+  info "── info ─────────────────────────"
+  say  "  file:     $base"
+  say  "  library:  ${#LIBRARY_FILES[@]} files    queue: ${#QUEUE[@]}"
+  say  "  target:   $RTMP_URL/***"
+  say  "  encode:   $VBITRATE CBR @ $RESOLUTION ${FPS}fps   audio ${ABITRATE}/${ACHANNELS}ch"
+  say  "  live:     bitrate=${br:-N/A}  speed=${sp:-N/A}  reconnects=$RECONNECTS"
+  say  "  keys:     n next · s reshuffle · i info · q quit"
+}
+
+handle_key() {
+  case "$1" in
+    n|N) warn ">> next"; INTENTIONAL_SKIP=1; kill -KILL "$FEEDER_PID" 2>/dev/null;;
+    s|S) shuffle_pool; QUEUE=( "${SHUFFLED[@]:0:$QUEUE_TARGET}" ); ok ">> reshuffled"; print_now;;
+    i|I) show_info;;
+    q|Q) on_signal;;
+  esac
+}
+
+# Wait until the feeder finishes OR the streamer dies, polling once a second and
+# servicing keystrokes / the stall watchdog meanwhile. Returns 0 if the feeder
+# ended (normal/skip/bad-file), 1 if the streamer died (→ reconnect).
+LAST_OUT=""; LAST_OUT_TS=0
+wait_feeder_or_streamer() {
+  local key now cur
+  LAST_OUT=""; LAST_OUT_TS=$(date +%s)
+  while kill -0 "$FEEDER_PID" 2>/dev/null; do
+    [ "$STOPPING" -ne 0 ] && return 0
+    if ! kill -0 "$STREAMER_PID" 2>/dev/null; then return 1; fi
+
+    # Stall watchdog: a half-open RTMP link freezes the streamer without making
+    # it exit. If progress stops advancing, force it down → triggers reconnect.
+    now=$(date +%s)
+    cur="$(last_progress out_time_us "$SPROG")"
+    if [ -n "$cur" ] && [ "$cur" != "$LAST_OUT" ]; then
+      LAST_OUT="$cur"; LAST_OUT_TS=$now
+    elif [ $(( now - LAST_OUT_TS )) -ge "$STALL_TIMEOUT" ]; then
+      warn ">> link stalled — forcing reconnect"
+      kill -KILL "$STREAMER_PID" 2>/dev/null
+      return 1
+    fi
+
+    if [ "$INTERACTIVE" -eq 1 ]; then
+      if IFS= read -rsn1 -t 1 key 2>/dev/null; then handle_key "$key"; fi
+    else
+      sleep 1
+    fi
+  done
+  wait "$FEEDER_PID" 2>/dev/null; FEEDER_RC=$?
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Main supervisor loop
+# ---------------------------------------------------------------------------
+scan_library
+[ "${#LIBRARY_FILES[@]}" -eq 0 ] && die "No videos ≥ ${MIN_MOVIE_MB}MB found under: $LIBRARY"
+refill_queue
+
+info "🦑 RTMP Squid CLI"
+say  "   library:  $LIBRARY  (${#LIBRARY_FILES[@]} files)"
+say  "   target:   $RTMP_URL/***"
+say  "   encode:   $VBITRATE CBR @ $RESOLUTION ${FPS}fps · audio ${ABITRATE}/${ACHANNELS}ch · fit=$FIT"
+say  "   order:    $([ "$SHUFFLE" -eq 1 ] && echo shuffle || echo sequential) · reconnect=$([ "$AUTO_RESTART" -eq 1 ] && echo on || echo off)"
+[ "$INTERACTIVE" -eq 1 ] && say "   controls: n next · s reshuffle · i info · q quit"
+say ""
+
+# Raw single-key input on a terminal (restored on exit by cleanup()).
+if [ "$INTERACTIVE" -eq 1 ]; then
+  STTY_SAVE="$(stty -g 2>/dev/null)"
+  stty -echo -icanon 2>/dev/null
+fi
+
+CONSEC_FAILS=0
+while [ "$STOPPING" -eq 0 ]; do
+  reset_pipe
+  start_streamer
+  STREAMER_STARTED=$(date +%s)
+
+  # Feed loop: keep the FIFO fed for as long as this streamer/connection lives.
+  while [ "$STOPPING" -eq 0 ]; do
+    if [ -n "$RESUME_SEC" ] && [ -n "$CURRENT_FILE" ]; then
+      spawn_feeder "$CURRENT_FILE" "$RESUME_SEC"   # resume after a reconnect
+      RESUME_SEC=""
+    else
+      dequeue
+      spawn_feeder "$NEXT_FILE" ""
+    fi
+    print_now
+
+    if wait_feeder_or_streamer; then
+      : # feeder ended (natural end, skip, or bad file)
+    else
+      # Streamer died → remember where we were, drop the feeder, go reconnect.
+      if [ "$FEEDER_KIND" = content ] && [ "$AUTO_RESTART" -eq 1 ]; then
+        local_off="$(content_offset)"
+        RESUME_SEC=$(( local_off > RESUME_REWIND ? local_off - RESUME_REWIND : 0 ))
+      fi
+      kill -KILL "$FEEDER_PID" 2>/dev/null
+      wait "$FEEDER_PID" 2>/dev/null
+      break
+    fi
+
+    advance_ts_offset
+
+    # Backoff if content fails instantly (a bad library shouldn't peg the CPU or
+    # race through every file at once). Slate / clean finishes reset it.
+    if [ "$FEEDER_KIND" = content ] && [ "$INTENTIONAL_SKIP" -eq 0 ] && [ "$FEEDER_RC" -ne 0 ]; then
+      warn ">> skipped unreadable file: ${CURRENT_FILE##*/}"
+      CONSEC_FAILS=$(( CONSEC_FAILS + 1 ))
+      d=$(( 250 * CONSEC_FAILS )); [ "$d" -gt 3000 ] && d=3000
+      sleep "$(awk -v ms="$d" 'BEGIN{printf "%.3f", ms/1000}')"
+    else
+      CONSEC_FAILS=0
+    fi
+    INTENTIONAL_SKIP=0
+  done
+
+  [ "$STOPPING" -ne 0 ] && break
+
+  if [ "$AUTO_RESTART" -eq 0 ]; then
+    err ">> stream ended (reconnect disabled). Last streamer log:"
+    tail -n 4 "$STREAMERLOG" 2>/dev/null >&2
+    break
+  fi
+
+  # Reconnect with capped exponential backoff; a healthy run resets the counter.
+  if [ $(( $(date +%s) - STREAMER_STARTED )) -gt "$HEALTHY_RUN" ]; then RECONNECTS=0; fi
+  RECONNECTS=$(( RECONNECTS + 1 ))
+  delay=$(( RECONNECT_BASE * (1 << (RECONNECTS - 1)) ))
+  [ "$delay" -gt "$RECONNECT_MAX" ] && delay=$RECONNECT_MAX
+  warn ">> RTMP connection lost — reconnecting in ${delay}s (attempt $RECONNECTS)"
+  i=0; while [ "$i" -lt "$delay" ] && [ "$STOPPING" -eq 0 ]; do sleep 1; i=$(( i + 1 )); done
+done
+
+cleanup
+exit 0
